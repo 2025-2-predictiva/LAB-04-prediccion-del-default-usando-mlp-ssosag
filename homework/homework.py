@@ -96,3 +96,138 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import json
+import gzip
+import pickle
+from glob import glob
+from pathlib import Path
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+def _cargar_y_limpia(ruta_zip: str) -> pd.DataFrame:
+    df = pd.read_csv(ruta_zip, compression="zip").copy()
+    df.rename(columns={"default payment next month": "default"}, inplace=True)
+    
+    if "ID" in df.columns:
+        df.drop(columns=["ID"], inplace=True)
+
+    df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)].copy()
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda v: 4 if v >= 4 else v)
+    return df.dropna()
+
+def _metricas(etiqueta: str, y_true, y_pred) -> dict:
+    return {
+        "type": "metrics",
+        "dataset": etiqueta,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+def _matriz_conf(etiqueta: str, y_true, y_pred) -> dict:
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": etiqueta,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+def _construir_busqueda(vars_cat, vars_num) -> GridSearchCV:
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(), vars_cat),
+            ("num", StandardScaler(), vars_num),
+        ]
+    )
+
+    pipe = Pipeline(
+        steps=[
+            ("pre", pre),
+            ("selector", SelectKBest(score_func=f_classif)),
+            ("pca", PCA()),
+            ("mlp", MLPClassifier(max_iter=15000, random_state=21)),
+        ]
+    )
+
+    grid = {
+        "selector__k": [20],
+        "pca__n_components": [None],
+        "mlp__hidden_layer_sizes": [(50, 30, 40, 60)],
+        "mlp__alpha": [0.26],
+        "mlp__learning_rate_init": [0.001],
+    }
+
+    return GridSearchCV(
+        estimator=pipe,
+        param_grid=grid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        refit=True,
+    )
+
+def main() -> None:
+    ruta_train = "files/input/train_data.csv.zip"
+    ruta_test = "files/input/test_data.csv.zip"
+
+    df_tr = _cargar_y_limpia(ruta_train)
+    df_te = _cargar_y_limpia(ruta_test)
+
+    X_tr, y_tr = df_tr.drop(columns=["default"]), df_tr["default"]
+    X_te, y_te = df_te.drop(columns=["default"]), df_te["default"]
+
+    cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+    num_cols = [c for c in X_tr.columns if c not in cat_cols]
+
+    search = _construir_busqueda(cat_cols, num_cols)
+    search.fit(X_tr, y_tr)
+
+    modelos_dir = Path("files/models")
+    if modelos_dir.exists():
+        for f in glob(str(modelos_dir / "*")):
+            os.remove(f)
+        try:
+            os.rmdir(modelos_dir)
+        except OSError:
+            pass
+    modelos_dir.mkdir(parents=True, exist_ok=True)
+
+    with gzip.open(modelos_dir / "model.pkl.gz", "wb") as fh:
+        pickle.dump(search, fh)
+
+    y_tr_pred = search.predict(X_tr)
+    y_te_pred = search.predict(X_te)
+
+    m_train = _metricas("train", y_tr, y_tr_pred)
+    m_test = _metricas("test", y_te, y_te_pred)
+    cm_train = _matriz_conf("train", y_tr, y_tr_pred)
+    cm_test = _matriz_conf("test", y_te, y_te_pred)
+
+    salidas = [m_train, m_test, cm_train, cm_test]
+
+    out_dir = Path("files/output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+        for registro in salidas:
+            f.write(json.dumps(registro) + "\n")
+
+if __name__ == "__main__":
+    main()
